@@ -1,46 +1,62 @@
 # `http-file-server`
 
-A compact static file server in Rust with a single-threaded nonblocking event loop and Linux-optimized file streaming.
+A compact static file server in Rust with a single-threaded nonblocking event loop, Linux-optimized file streaming, and HTTPS via kernel TLS offload (kTLS).
 
 ## Features
 
-- serves files from a chosen directory over HTTP
-- supports `GET` requests
-- serves `index.html` for directory paths
+- serves static files over HTTP or HTTPS
+- HTTPS uses kTLS — TLS encryption is handled by the Linux kernel, so `sendfile` remains zero-copy
+- supports TLS 1.2 and TLS 1.3 only
+- single-threaded nonblocking event loop, no async runtime
+- `sendfile(2)` and `TCP_CORK` on Linux for efficient file delivery
+- decodes percent-encoded paths
 - blocks path traversal outside the configured root
-- decodes percent-encoded paths like `%20`
-- streams files instead of loading entire bodies into memory
-- uses `sendfile` and `TCP_CORK` on Linux
+- serves `index.html` for directory paths
 
 ## Project layout
 
-- `src/lib.rs` — public crate entry point and end-to-end tests
-- `src/server.rs` — event loop, connection state, and file serving
+- `src/lib.rs` — public crate entry point and integration tests
+- `src/server.rs` — event loop, connection state machine, file serving
 - `src/request.rs` — request-line parsing and path decoding
 - `src/response.rs` — HTTP response serialization and MIME mapping
+- `src/tls.rs` — kTLS setsockopt structs, kernel TLS activation, certificate loading
 - `examples/serve.rs` — runnable example server
 
 ## Run the example server
+
+### HTTP
 
 ```bash
 cargo run --example serve -- /path/to/site
 ```
 
-If no directory is provided, the example serves the current working directory.
+Default bind address: `127.0.0.1:8080`. Override with the `BIND` environment variable.
 
-Default bind address:
+### HTTPS (kTLS)
 
-```text
-127.0.0.1:8080
+Generate a certificate first:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj '/CN=localhost' \
+  -addext 'subjectAltName=IP:127.0.0.1'
 ```
 
-Then open:
+Then run:
 
-```text
-http://127.0.0.1:8080
+```bash
+TLS_CERT=cert.pem TLS_KEY=key.pem cargo run --example serve -- /path/to/site
+```
+
+Requires the `tls` kernel module to be loaded:
+
+```bash
+sudo modprobe tls
 ```
 
 ## Use as a library
+
+### HTTP
 
 ```rust
 use http_file_server::Server;
@@ -51,32 +67,47 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-## Behavior
+### HTTPS
 
-- `GET /file.txt` returns the file if it exists
-- `GET /docs/` serves `docs/index.html` when present
-- non-`GET` methods return `405 Method Not Allowed`
-- missing files return `404 Not Found`
-- escaped paths outside the root return `403 Forbidden`
-- error responses are plain text and connections are closed after each response
+```rust
+use std::sync::Arc;
+use http_file_server::{Server, tls};
+
+fn main() -> std::io::Result<()> {
+    let config = tls::load_server_config(
+        std::path::Path::new("cert.pem"),
+        std::path::Path::new("key.pem"),
+    )?;
+    let server = Server::bind("0.0.0.0:443")?;
+    server.serve_tls("./public", config)
+}
+```
+
+## HTTP behavior
+
+- `GET /file.txt` — returns the file if it exists
+- `GET /docs/` — serves `docs/index.html` when present
+- non-`GET` methods — `405 Method Not Allowed`
+- missing files — `404 Not Found`
+- paths escaping the root — `403 Forbidden`
+- oversized request headers — `431 Request Header Fields Too Large`
+- connections close after each response (no keep-alive)
+
+## How kTLS works
+
+After the TLS handshake completes in userspace (via rustls), the session keys are handed to the kernel with `setsockopt(TCP_ULP, "tls")` plus `setsockopt(SOL_TLS, TLS_TX/RX, ...)`. From that point, all reads and writes on the socket — including `sendfile(2)` — are transparently encrypted and decrypted by the kernel. The application-layer code in `Connecting`, `Writing`, and `Sending` states is identical for HTTP and HTTPS.
 
 ## Development
 
-Run tests:
-
 ```bash
 cargo test
+cargo build
 ```
 
 ## Notes and limitations
 
-- no async runtime and no thread pool
+- Linux only for kTLS, `sendfile`, and `TCP_CORK`; plain HTTP builds and runs on other platforms
 - no keep-alive connections
 - no range requests
-- no directory listing generation
-- no TLS support
-- intended as a small, readable server rather than a full production web stack
-
-## Summary
-
-If you want a small Rust codebase that demonstrates manual HTTP parsing, nonblocking socket handling, safe static file resolution, and efficient Linux file streaming, this project is a good fit.
+- no directory listing
+- no client certificate authentication
