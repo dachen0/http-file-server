@@ -2,7 +2,10 @@ mod request;
 mod response;
 mod server;
 
-pub use server::Server;
+#[cfg(all(target_os = "linux", feature = "tls"))]
+pub mod tls;
+
+pub use server::{Server, ShutdownHandle};
 
 #[cfg(test)]
 mod tests {
@@ -10,6 +13,9 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir(std::path::PathBuf);
     impl Drop for TempDir {
@@ -19,14 +25,8 @@ mod tests {
     }
 
     fn make_server() -> (std::net::SocketAddr, TempDir) {
-        let root = std::env::temp_dir().join(format!(
-            "http_test_{}_{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos(),
-            std::thread::current().id(),
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("http_test_{}", TEST_ID.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&root).unwrap();
 
         let server = Server::bind("127.0.0.1:0").unwrap();

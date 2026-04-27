@@ -36,6 +36,10 @@ impl Request {
         let mut parts = line.splitn(3, ' ');
         let method_str = parts.next().ok_or(ParseError::InvalidRequestLine)?;
         let raw_path = parts.next().ok_or(ParseError::InvalidRequestLine)?;
+        let version = parts.next().ok_or(ParseError::InvalidRequestLine)?;
+        if version != "HTTP/1.1" && version != "HTTP/1.0" {
+            return Err(ParseError::InvalidRequestLine);
+        }
 
         let method = match method_str {
             "GET" => Method::Get,

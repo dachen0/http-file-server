@@ -1,9 +1,10 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::request::{self, Method, Request};
 use crate::response::{mime_for_ext, Response};
@@ -14,15 +15,16 @@ const MAX_RECEIVED_HEADERS_SIZE: usize = 4 * 1024;
 #[cfg(target_os = "linux")]
 fn set_tcp_cork(stream: &TcpStream, enable: bool) {
     let val = enable as libc::c_int;
-    unsafe {
+    let ret = unsafe {
         libc::setsockopt(
             stream.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_CORK,
             std::ptr::addr_of!(val).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+        )
+    };
+    debug_assert_eq!(ret, 0, "TCP_CORK setsockopt failed");
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -39,6 +41,9 @@ struct Sending {
 }
 
 impl Sending {
+    /// Send one `CHUNK_SIZE` slice of the file directly to the socket via
+    /// `sendfile(2)`, without copying bytes through user space.
+    /// Returns `true` while work remains, `false` when done or on error.
     #[cfg(target_os = "linux")]
     fn step(&mut self, stream: &mut TcpStream) -> bool {
         let ret = unsafe {
@@ -56,7 +61,10 @@ impl Sending {
                 false
             }
             n if n > 0 => true,
-            _ => io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock,
+            _ => {
+                let kind = io::Error::last_os_error().kind();
+                kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::Interrupted
+            }
         }
     }
 
@@ -76,9 +84,22 @@ impl Sending {
 // State
 // ---------------------------------------------------------------------------
 
+enum AfterWrite {
+    /// After flushing the header, start streaming this file.
+    File(Sending),
+    /// After flushing, close the connection.
+    Close,
+}
+
 enum State {
+    /// Performing the TLS handshake before any HTTP traffic.
+    #[cfg(all(target_os = "linux", feature = "tls"))]
+    TlsHandshaking { tls: Box<rustls::ServerConnection> },
     /// Accumulating incoming bytes until the full HTTP headers have arrived.
     Connecting { buf: [u8; MAX_RECEIVED_HEADERS_SIZE], offset: usize },
+    /// Draining `buf[written..]` to the socket non-blockingly; transitions via
+    /// `after` when the buffer is fully flushed.
+    Writing { buf: Vec<u8>, written: usize, after: AfterWrite },
     /// Headers parsed; streaming the file response.
     Sending(Sending),
     /// Placeholder used only during `std::mem::replace`.
@@ -96,7 +117,34 @@ struct Connection {
 
 impl Connection {
     fn new(stream: TcpStream) -> Self {
-        Connection { stream, state: State::Connecting { buf: [0u8; MAX_RECEIVED_HEADERS_SIZE], offset: 0 } }
+        Connection {
+            stream,
+            state: State::Connecting { buf: [0u8; MAX_RECEIVED_HEADERS_SIZE], offset: 0 },
+        }
+    }
+
+    /// Queue a response for non-blocking writing. For file responses, TCP_CORK
+    /// is set so the header and first file chunk coalesce into fewer packets.
+    fn queue_response(&mut self, response: Response) {
+        match response {
+            Response::File { header, file } => {
+                set_tcp_cork(&self.stream, true);
+                self.state = State::Writing {
+                    buf: header,
+                    written: 0,
+                    after: AfterWrite::File(Sending {
+                        file,
+                        #[cfg(target_os = "linux")]
+                        offset: 0,
+                    }),
+                };
+            }
+            Response::Bytes { header, body } => {
+                let mut buf = header;
+                buf.extend_from_slice(body);
+                self.state = State::Writing { buf, written: 0, after: AfterWrite::Close };
+            }
+        }
     }
 
     /// Advance this connection by one step.
@@ -105,46 +153,107 @@ impl Connection {
         let state = std::mem::replace(&mut self.state, State::Done);
 
         match state {
+            #[cfg(all(target_os = "linux", feature = "tls"))]
+            State::TlsHandshaking { mut tls } => {
+                // RX: drain socket bytes into rustls's read buffer
+                loop {
+                    match tls.read_tls(&mut self.stream) {
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) | Ok(0) => return false,
+                        Ok(_) => {}
+                    }
+                    if tls.process_new_packets().is_err() {
+                        // Flush any alert rustls queued before closing.
+                        let _ = tls.write_tls(&mut self.stream);
+                        return false;
+                    }
+                    break;
+                }
+                // TX: flush any pending outgoing handshake records
+                loop {
+                    match tls.write_tls(&mut self.stream) {
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                if tls.is_handshaking() {
+                    self.state = State::TlsHandshaking { tls };
+                    return true;
+                }
+
+                // Handshake complete — extract session keys and activate kTLS.
+                let version = match tls.protocol_version() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let tls_owned = *tls;
+                let secrets = match tls_owned.dangerous_extract_secrets() {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                if crate::tls::setup_ktls(self.stream.as_raw_fd(), secrets, version).is_err() {
+                    return false;
+                }
+                // The kernel now handles all TLS on this fd transparently.
+                self.state =
+                    State::Connecting { buf: [0u8; MAX_RECEIVED_HEADERS_SIZE], offset: 0 };
+                true
+            }
+
             State::Connecting { mut buf, mut offset } => {
                 match self.stream.read(&mut buf[offset..]) {
                     Ok(0) => return false,
                     Ok(n) => offset += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                           || e.kind() == io::ErrorKind::Interrupted => {
                         self.state = State::Connecting { buf, offset };
                         return true;
                     }
                     Err(_) => return false,
                 }
 
-                if let Some(end) = request::headers_end(&buf) {
+                if let Some(end) = request::headers_end(&buf[..offset]) {
                     let response = match Request::parse(&buf[..end]) {
                         Ok(req) if req.method == Method::Get => serve_file(&req.path, root),
                         Ok(_) => Response::method_not_allowed(),
                         Err(_) => Response::bad_request(),
                     };
-                    match response {
-                        Response::File { header, file } => {
-                            // Cork so the header and the first file chunk
-                            // are coalesced into as few packets as possible.
-                            set_tcp_cork(&self.stream, true);
-                            let _ = self.stream.write_all(&header);
-                            self.state = State::Sending(Sending {
-                                file,
-                                #[cfg(target_os = "linux")]
-                                offset: 0,
-                            });
-                            true
-                        }
-                        Response::Bytes { header, body } => {
-                            // Error responses are small; write them directly and close.
-                            let _ = self.stream.write_all(&header);
-                            let _ = self.stream.write_all(body);
-                            false
-                        }
-                    }
+                    self.queue_response(response);
+                    true
+                } else if offset == MAX_RECEIVED_HEADERS_SIZE {
+                    // Buffer full with no header terminator — headers too large.
+                    self.queue_response(Response::header_fields_too_large());
+                    true
                 } else {
                     self.state = State::Connecting { buf, offset };
                     true
+                }
+            }
+
+            State::Writing { buf, mut written, after } => {
+                match self.stream.write(&buf[written..]) {
+                    Ok(0) => return false,
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                           || e.kind() == io::ErrorKind::Interrupted => {
+                        self.state = State::Writing { buf, written, after };
+                        return true;
+                    }
+                    Err(_) => return false,
+                }
+                if written < buf.len() {
+                    self.state = State::Writing { buf, written, after };
+                    return true;
+                }
+                match after {
+                    AfterWrite::File(sending) => {
+                        self.state = State::Sending(sending);
+                        true
+                    }
+                    AfterWrite::Close => false,
                 }
             }
 
@@ -165,32 +274,55 @@ impl Connection {
 // Server
 // ---------------------------------------------------------------------------
 
+/// A handle that lets callers stop a running [`Server::serve`] loop.
+pub struct ShutdownHandle(Arc<AtomicBool>);
+
+impl ShutdownHandle {
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct Server {
     listener: TcpListener,
+    stop: Arc<AtomicBool>,
 }
 
 impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Ok(Server { listener })
+        Ok(Server { listener, stop: Arc::new(AtomicBool::new(false)) })
     }
 
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
 
-    /// Serve static files from `root` in a single-threaded event loop.
+    /// Returns a handle that can stop the [`serve`](Self::serve) loop.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(Arc::clone(&self.stop))
+    }
+
+    /// Serve static files from `root` in a single-threaded polling event loop.
     /// No threads are spawned; every connection is advanced one step per
-    /// iteration of the main loop.
+    /// iteration of the main loop. The loop busy-spins while connections are
+    /// active, trading CPU for minimal latency; it yields when idle.
+    /// Call [`shutdown_handle`](Self::shutdown_handle) before `serve` to get a
+    /// handle that stops the loop cleanly from another thread.
     pub fn serve<P: AsRef<Path>>(self, root: P) -> io::Result<()> {
         let root = fs::canonicalize(root.as_ref())?;
-        self.listener.set_nonblocking(true)?;
+        let Server { listener, stop } = self;
+        listener.set_nonblocking(true)?;
 
         let mut connections: Vec<Connection> = Vec::new();
 
         loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
             loop {
-                match self.listener.accept() {
+                match listener.accept() {
                     Ok((stream, _addr)) => {
                         if stream.set_nonblocking(true).is_ok() {
                             connections.push(Connection::new(stream));
@@ -198,6 +330,56 @@ impl Server {
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => eprintln!("[http-server] accept error: {e}"),
+                }
+            }
+
+            connections.retain_mut(|conn| conn.advance(&root));
+
+            // No active connections — yield rather than spin-burn a CPU core.
+            if connections.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Serve static files over HTTPS using kernel TLS (kTLS).
+    ///
+    /// kTLS offloads TLS encryption to the kernel after the userspace handshake,
+    /// so `sendfile(2)` continues to work zero-copy for file responses.
+    /// Requires Linux kernel ≥ 4.13 with `CONFIG_TLS` and the `tls` kernel module
+    /// loaded (`modprobe tls`).  Only TLS 1.2 and 1.3 are accepted.
+    #[cfg(all(target_os = "linux", feature = "tls"))]
+    pub fn serve_tls<P: AsRef<Path>>(
+        self,
+        root: P,
+        tls_config: Arc<rustls::ServerConfig>,
+    ) -> io::Result<()> {
+        let root = fs::canonicalize(root.as_ref())?;
+        let Server { listener, stop } = self;
+        listener.set_nonblocking(true)?;
+
+        let mut connections: Vec<Connection> = Vec::new();
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        if stream.set_nonblocking(true).is_ok() {
+                            match rustls::ServerConnection::new(Arc::clone(&tls_config)) {
+                                Ok(tls) => connections.push(Connection {
+                                    stream,
+                                    state: State::TlsHandshaking { tls: Box::new(tls) },
+                                }),
+                                Err(e) => eprintln!("[https-server] TLS init error: {e}"),
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => eprintln!("[https-server] accept error: {e}"),
                 }
             }
 
@@ -215,6 +397,14 @@ impl Server {
 // ---------------------------------------------------------------------------
 
 fn serve_file(url_path: &str, root: &Path) -> Response {
+    // Reject any path that contains ".." segments before touching the filesystem.
+    // This ensures traversal attempts always get 403, regardless of whether the
+    // escaped path happens to exist. The canonicalize+starts_with check below
+    // still provides defense-in-depth against symlink escapes.
+    if url_path.split('/').any(|seg| seg == "..") {
+        return Response::forbidden();
+    }
+
     let candidate = root.join(url_path.trim_start_matches('/'));
 
     let canonical = match fs::canonicalize(&candidate) {
