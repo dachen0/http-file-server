@@ -7,6 +7,8 @@ pub mod tls;
 
 pub use server::{Server, ShutdownHandle};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(test)]
 mod tests {
     use super::*;

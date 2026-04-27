@@ -1,3 +1,4 @@
+use crate::VERSION;
 use std::fs;
 
 /// A response that carries its own serialised header bytes plus a body.
@@ -21,7 +22,7 @@ impl Response {
             Err(_) => return Self::internal_error(),
         };
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {size}\r\nServer: fast-http/{VERSION}\r\nConnection: close\r\n\r\n"
         )
         .into_bytes();
         Response::File { header, file }
