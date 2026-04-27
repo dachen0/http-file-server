@@ -87,7 +87,7 @@ pub fn setup_ktls(
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unsupported TLS version for kTLS",
-            ))
+            ));
         }
     };
     enable_tls_ulp(fd)?;
@@ -102,9 +102,7 @@ fn enable_tls_ulp(fd: RawFd) -> io::Result<()> {
     // The kernel expects exactly the 3-byte string "tls" (no null terminator
     // in the optlen — the terminator is excluded from the count).
     let tls = b"tls\0";
-    let ret = unsafe {
-        libc::setsockopt(fd, libc::IPPROTO_TCP, TCP_ULP, tls.as_ptr().cast(), 3)
-    };
+    let ret = unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, TCP_ULP, tls.as_ptr().cast(), 3) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -206,11 +204,15 @@ pub fn load_server_config(cert_path: &Path, key_path: &Path) -> io::Result<Arc<S
         ));
     }
 
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(fs::File::open(key_path)?))?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "no private key found in key file")
-            })?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(
+        fs::File::open(key_path)?,
+    ))?
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no private key found in key file",
+        )
+    })?;
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()

@@ -1,8 +1,6 @@
 /// Returns the byte offset just past `\r\n\r\n`, or `None` if headers are incomplete.
 pub fn headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,8 +28,8 @@ impl Request {
             .position(|w| w == b"\r\n")
             .ok_or(ParseError::InvalidRequestLine)?;
 
-        let line = std::str::from_utf8(&buf[..line_end])
-            .map_err(|_| ParseError::InvalidRequestLine)?;
+        let line =
+            std::str::from_utf8(&buf[..line_end]).map_err(|_| ParseError::InvalidRequestLine)?;
 
         let mut parts = line.splitn(3, ' ');
         let method_str = parts.next().ok_or(ParseError::InvalidRequestLine)?;

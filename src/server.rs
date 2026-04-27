@@ -3,11 +3,11 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::request::{self, Method, Request};
-use crate::response::{mime_for_ext, Response};
+use crate::response::{Response, mime_for_ext};
 
 const CHUNK_SIZE: usize = 8 * 1024;
 const MAX_RECEIVED_HEADERS_SIZE: usize = 4 * 1024;
@@ -96,10 +96,17 @@ enum State {
     #[cfg(all(target_os = "linux", feature = "tls"))]
     TlsHandshaking { tls: Box<rustls::ServerConnection> },
     /// Accumulating incoming bytes until the full HTTP headers have arrived.
-    Connecting { buf: [u8; MAX_RECEIVED_HEADERS_SIZE], offset: usize },
+    Connecting {
+        buf: [u8; MAX_RECEIVED_HEADERS_SIZE],
+        offset: usize,
+    },
     /// Draining `buf[written..]` to the socket non-blockingly; transitions via
     /// `after` when the buffer is fully flushed.
-    Writing { buf: Vec<u8>, written: usize, after: AfterWrite },
+    Writing {
+        buf: Vec<u8>,
+        written: usize,
+        after: AfterWrite,
+    },
     /// Headers parsed; streaming the file response.
     Sending(Sending),
     /// Placeholder used only during `std::mem::replace`.
@@ -119,7 +126,10 @@ impl Connection {
     fn new(stream: TcpStream) -> Self {
         Connection {
             stream,
-            state: State::Connecting { buf: [0u8; MAX_RECEIVED_HEADERS_SIZE], offset: 0 },
+            state: State::Connecting {
+                buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
+                offset: 0,
+            },
         }
     }
 
@@ -142,7 +152,11 @@ impl Connection {
             Response::Bytes { header, body } => {
                 let mut buf = header;
                 buf.extend_from_slice(body);
-                self.state = State::Writing { buf, written: 0, after: AfterWrite::Close };
+                self.state = State::Writing {
+                    buf,
+                    written: 0,
+                    after: AfterWrite::Close,
+                };
             }
         }
     }
@@ -198,17 +212,24 @@ impl Connection {
                     return false;
                 }
                 // The kernel now handles all TLS on this fd transparently.
-                self.state =
-                    State::Connecting { buf: [0u8; MAX_RECEIVED_HEADERS_SIZE], offset: 0 };
+                self.state = State::Connecting {
+                    buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
+                    offset: 0,
+                };
                 true
             }
 
-            State::Connecting { mut buf, mut offset } => {
+            State::Connecting {
+                mut buf,
+                mut offset,
+            } => {
                 match self.stream.read(&mut buf[offset..]) {
                     Ok(0) => return false,
                     Ok(n) => offset += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                           || e.kind() == io::ErrorKind::Interrupted => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
                         self.state = State::Connecting { buf, offset };
                         return true;
                     }
@@ -233,19 +254,33 @@ impl Connection {
                 }
             }
 
-            State::Writing { buf, mut written, after } => {
+            State::Writing {
+                buf,
+                mut written,
+                after,
+            } => {
                 match self.stream.write(&buf[written..]) {
                     Ok(0) => return false,
                     Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                           || e.kind() == io::ErrorKind::Interrupted => {
-                        self.state = State::Writing { buf, written, after };
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        self.state = State::Writing {
+                            buf,
+                            written,
+                            after,
+                        };
                         return true;
                     }
                     Err(_) => return false,
                 }
                 if written < buf.len() {
-                    self.state = State::Writing { buf, written, after };
+                    self.state = State::Writing {
+                        buf,
+                        written,
+                        after,
+                    };
                     return true;
                 }
                 match after {
@@ -291,7 +326,10 @@ pub struct Server {
 impl Server {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Ok(Server { listener, stop: Arc::new(AtomicBool::new(false)) })
+        Ok(Server {
+            listener,
+            stop: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {

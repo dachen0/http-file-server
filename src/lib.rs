@@ -25,14 +25,18 @@ mod tests {
     }
 
     fn make_server() -> (std::net::SocketAddr, TempDir) {
-        let root = std::env::temp_dir()
-            .join(format!("http_test_{}", TEST_ID.fetch_add(1, Ordering::Relaxed)));
+        let root = std::env::temp_dir().join(format!(
+            "http_test_{}",
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&root).unwrap();
 
         let server = Server::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
         let root_clone = root.clone();
-        std::thread::spawn(move || { let _ = server.serve(root_clone); });
+        std::thread::spawn(move || {
+            let _ = server.serve(root_clone);
+        });
 
         (addr, TempDir(root))
     }
