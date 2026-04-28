@@ -174,11 +174,18 @@ impl Connection {
                     match tls.read_tls(&mut self.stream) {
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) | Ok(0) => return false,
+                        Err(e) => {
+                            eprintln!("[tls] read_tls error: {e}");
+                            return false;
+                        }
+                        Ok(0) => {
+                            eprintln!("[tls] read_tls: peer closed");
+                            return false;
+                        }
                         Ok(_) => {}
                     }
-                    if tls.process_new_packets().is_err() {
-                        // Flush any alert rustls queued before closing.
+                    if let Err(e) = tls.process_new_packets() {
+                        eprintln!("[tls] process_new_packets error: {e}");
                         let _ = tls.write_tls(&mut self.stream);
                         return false;
                     }
@@ -188,7 +195,11 @@ impl Connection {
                 loop {
                     match tls.write_tls(&mut self.stream) {
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        Err(e) => {
+                            eprintln!("[tls] write_tls error: {e}");
+                            break;
+                        }
                         Ok(_) => {}
                     }
                 }
@@ -201,21 +212,41 @@ impl Connection {
                 // Handshake complete — extract session keys and activate kTLS.
                 let version = match tls.protocol_version() {
                     Some(v) => v,
-                    None => return false,
+                    None => {
+                        eprintln!("[tls] protocol_version() returned None");
+                        return false;
+                    }
                 };
+
+                // Rescue any plaintext rustls already decrypted into its
+                // internal buffer.  Clients (e.g. curl with TLS 1.3) often
+                // pipeline the HTTP request in the same TCP write as the TLS
+                // Finished message.  read_tls() consumed those bytes from the
+                // kernel socket buffer into rustls; if we don't drain them
+                // before dropping the ServerConnection they are lost forever.
+                let mut buf = [0u8; MAX_RECEIVED_HEADERS_SIZE];
+                let mut offset = 0usize;
+                loop {
+                    match tls.reader().read(&mut buf[offset..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => offset += n,
+                    }
+                }
+
                 let tls_owned = *tls;
                 let secrets = match tls_owned.dangerous_extract_secrets() {
                     Ok(s) => s,
-                    Err(_) => return false,
+                    Err(e) => {
+                        eprintln!("[tls] dangerous_extract_secrets failed: {e}");
+                        return false;
+                    }
                 };
-                if crate::tls::setup_ktls(self.stream.as_raw_fd(), secrets, version).is_err() {
+                if let Err(e) = crate::tls::setup_ktls(self.stream.as_raw_fd(), secrets, version) {
+                    eprintln!("[tls] setup_ktls failed: {e}");
                     return false;
                 }
                 // The kernel now handles all TLS on this fd transparently.
-                self.state = State::Connecting {
-                    buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
-                    offset: 0,
-                };
+                self.state = State::Connecting { buf, offset };
                 true
             }
 
@@ -230,8 +261,9 @@ impl Connection {
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::Interrupted =>
                     {
-                        self.state = State::Connecting { buf, offset };
-                        return true;
+                        // Fall through: check whether the buffer already holds
+                        // complete headers (can happen when bytes arrived via
+                        // the rustls plaintext drain path after kTLS setup).
                     }
                     Err(_) => return false,
                 }

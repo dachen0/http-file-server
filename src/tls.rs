@@ -99,12 +99,28 @@ pub fn setup_ktls(
 }
 
 fn enable_tls_ulp(fd: RawFd) -> io::Result<()> {
+    // Verify the socket is still connected before attempting TCP_ULP setup.
+    let peer_ok = unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        libc::getpeername(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) == 0
+    };
+    if !peer_ok {
+        eprintln!("[ktls] getpeername failed on fd {fd}: socket not connected");
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket disconnected before kTLS setup",
+        ));
+    }
+
     // The kernel expects exactly the 3-byte string "tls" (no null terminator
     // in the optlen — the terminator is excluded from the count).
     let tls = b"tls\0";
     let ret = unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, TCP_ULP, tls.as_ptr().cast(), 3) };
     if ret != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        eprintln!("[ktls] setsockopt(TCP_ULP) failed on fd {fd}: {err}");
+        return Err(err);
     }
     Ok(())
 }
