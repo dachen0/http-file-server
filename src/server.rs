@@ -36,16 +36,17 @@ fn set_tcp_cork(_stream: &TcpStream, _enable: bool) {}
 
 struct Sending {
     file: fs::File,
+    keepalive: bool,
     #[cfg(target_os = "linux")]
     offset: libc::off_t,
 }
 
 impl Sending {
-    /// Send one `CHUNK_SIZE` slice of the file directly to the socket via
-    /// `sendfile(2)`, without copying bytes through user space.
-    /// Returns `true` while work remains, `false` when done or on error.
+    /// Advance the file send by one chunk.
+    /// Returns `Some(true)` while more data remains, `Some(false)` on clean EOF,
+    /// `None` on an unrecoverable I/O error.
     #[cfg(target_os = "linux")]
-    fn step(&mut self, stream: &mut TcpStream) -> bool {
+    fn step(&mut self, stream: &mut TcpStream) -> Option<bool> {
         let ret = unsafe {
             libc::sendfile(
                 stream.as_raw_fd(),
@@ -56,26 +57,35 @@ impl Sending {
         };
         match ret {
             0 => {
-                // EOF — lift the cork so the kernel flushes any buffered data.
                 set_tcp_cork(stream, false);
-                false
+                Some(false)
             }
-            n if n > 0 => true,
+            n if n > 0 => Some(true),
             _ => {
                 let kind = io::Error::last_os_error().kind();
-                kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::Interrupted
+                if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::Interrupted {
+                    Some(true)
+                } else {
+                    None
+                }
             }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn step(&mut self, stream: &mut TcpStream) -> bool {
+    fn step(&mut self, stream: &mut TcpStream) -> Option<bool> {
         let mut chunk = [0u8; CHUNK_SIZE];
         match self.file.read(&mut chunk) {
-            Ok(0) => false,
-            Ok(n) => stream.write_all(&chunk[..n]).is_ok(),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
+            Ok(0) => Some(false),
+            Ok(n) => {
+                if stream.write_all(&chunk[..n]).is_ok() {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Some(true),
+            Err(_) => None,
         }
     }
 }
@@ -137,13 +147,18 @@ impl Connection {
     /// is set so the header and first file chunk coalesce into fewer packets.
     fn queue_response(&mut self, response: Response) {
         match response {
-            Response::File { header, file } => {
+            Response::File {
+                header,
+                file,
+                keepalive,
+            } => {
                 set_tcp_cork(&self.stream, true);
                 self.state = State::Writing {
                     buf: header,
                     written: 0,
                     after: AfterWrite::File(Sending {
                         file,
+                        keepalive,
                         #[cfg(target_os = "linux")]
                         offset: 0,
                     }),
@@ -281,7 +296,9 @@ impl Connection {
 
                 if let Some(end) = request::headers_end(&buf[..offset]) {
                     let response = match Request::parse(&buf[..end]) {
-                        Ok(req) if req.method == Method::Get => serve_file(&req.path, root),
+                        Ok(req) if req.method == Method::Get => {
+                            serve_file(&req.path, root, req.keepalive)
+                        }
                         Ok(_) => Response::method_not_allowed(),
                         Err(_) => Response::bad_request(),
                     };
@@ -335,13 +352,20 @@ impl Connection {
                 }
             }
 
-            State::Sending(mut sending) => {
-                let keep = sending.step(&mut self.stream);
-                if keep {
+            State::Sending(mut sending) => match sending.step(&mut self.stream) {
+                Some(true) => {
                     self.state = State::Sending(sending);
+                    true
                 }
-                keep
-            }
+                Some(false) if sending.keepalive => {
+                    self.state = State::Connecting {
+                        buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
+                        offset: 0,
+                    };
+                    true
+                }
+                _ => false,
+            },
 
             State::Done => false,
         }
@@ -477,7 +501,7 @@ impl Server {
 // File resolution
 // ---------------------------------------------------------------------------
 
-fn serve_file(url_path: &str, root: &Path) -> Response {
+fn serve_file(url_path: &str, root: &Path, keepalive: bool) -> Response {
     // Reject any path that contains ".." segments before touching the filesystem.
     // This ensures traversal attempts always get 403, regardless of whether the
     // escaped path happens to exist. The canonicalize+starts_with check below
@@ -507,7 +531,7 @@ fn serve_file(url_path: &str, root: &Path) -> Response {
     match fs::File::open(&file_path) {
         Ok(file) => {
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            Response::ok(file, mime_for_ext(ext))
+            Response::ok(file, mime_for_ext(ext), keepalive)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Response::not_found(),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Response::forbidden(),

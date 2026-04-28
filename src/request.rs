@@ -13,6 +13,7 @@ pub enum Method {
 pub struct Request {
     pub method: Method,
     pub path: String,
+    pub keepalive: bool,
 }
 
 #[derive(Debug)]
@@ -47,8 +48,49 @@ impl Request {
         let path_only = raw_path.split('?').next().unwrap_or("/");
         let path = percent_decode(path_only).map_err(|_| ParseError::InvalidRequestLine)?;
 
-        Ok(Request { method, path })
+        let keepalive = connection_keepalive(&buf[line_end + 2..], version == "HTTP/1.1");
+
+        Ok(Request {
+            method,
+            path,
+            keepalive,
+        })
     }
+}
+
+fn trim_bytes(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if start < end { &s[start..end] } else { b"" }
+}
+
+fn connection_keepalive(headers: &[u8], default_keepalive: bool) -> bool {
+    let mut pos = 0;
+    while pos < headers.len() {
+        let end = match headers[pos..].windows(2).position(|w| w == b"\r\n") {
+            Some(i) => pos + i,
+            None => break,
+        };
+        let line = &headers[pos..end];
+        if line.len() > 11 && line[..11].eq_ignore_ascii_case(b"connection:") {
+            let val = trim_bytes(&line[11..]);
+            if val.eq_ignore_ascii_case(b"close") {
+                return false;
+            }
+            if val.eq_ignore_ascii_case(b"keep-alive") {
+                return true;
+            }
+        }
+        pos = end + 2;
+    }
+    default_keepalive
 }
 
 fn percent_decode(s: &str) -> Result<String, std::string::FromUtf8Error> {

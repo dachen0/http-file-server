@@ -8,6 +8,7 @@ pub enum Response {
     File {
         header: Vec<u8>,
         file: fs::File,
+        keepalive: bool,
     },
     Bytes {
         header: Vec<u8>,
@@ -16,16 +17,21 @@ pub enum Response {
 }
 
 impl Response {
-    pub fn ok(file: fs::File, content_type: &'static str) -> Self {
+    pub fn ok(file: fs::File, content_type: &'static str, keepalive: bool) -> Self {
         let size = match file.metadata() {
             Ok(metadata) => metadata.len(),
             Err(_) => return Self::internal_error(),
         };
+        let conn = if keepalive { "keep-alive" } else { "close" };
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {size}\r\nServer: fast-http/{VERSION}\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {size}\r\nServer: fast-http/{VERSION}\r\nConnection: {conn}\r\n\r\n"
         )
         .into_bytes();
-        Response::File { header, file }
+        Response::File {
+            header,
+            file,
+            keepalive,
+        }
     }
 
     pub fn not_found() -> Self {

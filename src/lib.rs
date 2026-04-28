@@ -45,7 +45,11 @@ mod tests {
 
     fn get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
         let mut conn = TcpStream::connect(addr).unwrap();
-        write!(conn, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        write!(
+            conn,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
         let mut buf = String::new();
         conn.read_to_string(&mut buf).unwrap();
         let status: u16 = buf
