@@ -7,6 +7,7 @@ A compact static file server in Rust with a single-threaded nonblocking event lo
 - serves static files over HTTP or HTTPS
 - HTTPS uses kTLS — TLS encryption is handled by the Linux kernel, so `sendfile` remains zero-copy
 - supports TLS 1.2 and TLS 1.3 only
+- supports keep-alive
 - single-threaded nonblocking event loop, no async runtime
 - `sendfile(2)` and `TCP_CORK` on Linux for efficient file delivery
 - decodes percent-encoded paths
@@ -107,7 +108,6 @@ cargo build
 ## Notes and limitations
 
 - Linux only for kTLS, `sendfile`, and `TCP_CORK`; plain HTTP builds and runs on other platforms
-- no keep-alive connections
 - no range requests
 - no directory listing
 - no client certificate authentication
