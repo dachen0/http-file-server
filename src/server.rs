@@ -218,6 +218,17 @@ impl Connection {
                     }
                 };
 
+                // Flush any post-handshake records rustls generated (e.g.
+                // NewSessionTicket in TLS 1.3).  These must reach the client
+                // before we hand the fd to the kernel; once kTLS is active the
+                // ServerConnection is gone and the tickets would be lost.
+                loop {
+                    match tls.write_tls(&mut self.stream) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+
                 // Rescue any plaintext rustls already decrypted into its
                 // internal buffer.  Clients (e.g. curl with TLS 1.3) often
                 // pipeline the HTTP request in the same TCP write as the TLS
