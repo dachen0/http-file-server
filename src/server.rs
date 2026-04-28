@@ -5,12 +5,25 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::request::{self, Method, Request};
 use crate::response::{Response, mime_for_ext};
 
 const CHUNK_SIZE: usize = 8 * 1024;
 const MAX_RECEIVED_HEADERS_SIZE: usize = 4 * 1024;
+
+/// Maximum number of concurrent connections. New connections are dropped when
+/// this limit is reached rather than queued, preventing fd exhaustion.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Deadline for receiving complete request headers after a connection is
+/// accepted (or after a keep-alive response finishes). Guards against
+/// Slowloris-style attacks that hold connections open with partial headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an idle keep-alive connection may wait for the next request.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(target_os = "linux")]
 fn set_tcp_cork(stream: &TcpStream, enable: bool) {
@@ -130,6 +143,9 @@ enum State {
 struct Connection {
     stream: TcpStream,
     state: State,
+    /// Wall-clock deadline after which this connection is forcibly dropped.
+    /// Reset on each state transition so the timeout tracks the *current* phase.
+    deadline: Instant,
 }
 
 impl Connection {
@@ -140,6 +156,7 @@ impl Connection {
                 buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
                 offset: 0,
             },
+            deadline: Instant::now() + HEADER_TIMEOUT,
         }
     }
 
@@ -179,6 +196,9 @@ impl Connection {
     /// Advance this connection by one step.
     /// Returns `true` to keep it, `false` to drop it.
     fn advance(&mut self, root: &Path) -> bool {
+        if Instant::now() >= self.deadline {
+            return false;
+        }
         let state = std::mem::replace(&mut self.state, State::Done);
 
         match state {
@@ -362,6 +382,7 @@ impl Connection {
                         buf: [0u8; MAX_RECEIVED_HEADERS_SIZE],
                         offset: 0,
                     };
+                    self.deadline = Instant::now() + IDLE_TIMEOUT;
                     true
                 }
                 _ => false,
@@ -427,6 +448,9 @@ impl Server {
             }
 
             loop {
+                if connections.len() >= MAX_CONNECTIONS {
+                    break;
+                }
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         if stream.set_nonblocking(true).is_ok() {
@@ -471,6 +495,9 @@ impl Server {
             }
 
             loop {
+                if connections.len() >= MAX_CONNECTIONS {
+                    break;
+                }
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         if stream.set_nonblocking(true).is_ok() {
@@ -478,6 +505,7 @@ impl Server {
                                 Ok(tls) => connections.push(Connection {
                                     stream,
                                     state: State::TlsHandshaking { tls: Box::new(tls) },
+                                    deadline: Instant::now() + HEADER_TIMEOUT,
                                 }),
                                 Err(e) => eprintln!("[https-server] TLS init error: {e}"),
                             }
