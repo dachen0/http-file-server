@@ -13,9 +13,21 @@ use crate::response::{Response, mime_for_ext};
 const CHUNK_SIZE: usize = 8 * 1024;
 const MAX_RECEIVED_HEADERS_SIZE: usize = 4 * 1024;
 
-/// Maximum number of concurrent connections. New connections are dropped when
-/// this limit is reached rather than queued, preventing fd exhaustion.
+/// Maximum number of concurrent connections. New connections are left in the
+/// kernel's accept backlog when this limit is reached. The effective limit is
+/// further capped by `RLIMIT_NOFILE` (see [`connection_limit`]).
 const MAX_CONNECTIONS: usize = 4096;
+
+/// Each connection can hold two descriptors: the socket and the file it serves.
+const FDS_PER_CONNECTION: libc::rlim_t = 2;
+
+/// Descriptors kept out of the connection budget for stdio, the listener, TLS
+/// key material and anything else the embedding process opens.
+const RESERVED_FDS: libc::rlim_t = 64;
+
+/// How long to stop accepting after running out of descriptors, giving
+/// in-flight connections time to finish and release theirs.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Deadline for receiving complete request headers after a connection is
 /// accepted (or after a keep-alive response finishes). Guards against
@@ -436,39 +448,9 @@ impl Server {
     /// Call [`shutdown_handle`](Self::shutdown_handle) before `serve` to get a
     /// handle that stops the loop cleanly from another thread.
     pub fn serve<P: AsRef<Path>>(self, root: P) -> io::Result<()> {
-        let root = fs::canonicalize(root.as_ref())?;
-        let Server { listener, stop } = self;
-        listener.set_nonblocking(true)?;
-
-        let mut connections: Vec<Connection> = Vec::new();
-
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            loop {
-                if connections.len() >= MAX_CONNECTIONS {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        if stream.set_nonblocking(true).is_ok() {
-                            connections.push(Connection::new(stream));
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => eprintln!("[http-server] accept error: {e}"),
-                }
-            }
-
-            connections.retain_mut(|conn| conn.advance(&root));
-
-            // No active connections — yield rather than spin-burn a CPU core.
-            if connections.is_empty() {
-                std::thread::yield_now();
-            }
-        }
+        self.run(root.as_ref(), "http-server", |stream| {
+            Some(Connection::new(stream))
+        })
     }
 
     /// Serve static files over HTTPS using kernel TLS (kTLS).
@@ -483,46 +465,125 @@ impl Server {
         root: P,
         tls_config: Arc<rustls::ServerConfig>,
     ) -> io::Result<()> {
-        let root = fs::canonicalize(root.as_ref())?;
+        self.run(
+            root.as_ref(),
+            "https-server",
+            |stream| match rustls::ServerConnection::new(Arc::clone(&tls_config)) {
+                Ok(tls) => Some(Connection {
+                    stream,
+                    state: State::TlsHandshaking { tls: Box::new(tls) },
+                    deadline: Instant::now() + HEADER_TIMEOUT,
+                }),
+                Err(e) => {
+                    eprintln!("[https-server] TLS init error: {e}");
+                    None
+                }
+            },
+        )
+    }
+
+    /// The event loop shared by [`serve`](Self::serve) and `serve_tls`.
+    /// `new_connection` wraps each accepted socket; returning `None` drops it.
+    fn run(
+        self,
+        root: &Path,
+        tag: &str,
+        mut new_connection: impl FnMut(TcpStream) -> Option<Connection>,
+    ) -> io::Result<()> {
+        let root = fs::canonicalize(root)?;
         let Server { listener, stop } = self;
         listener.set_nonblocking(true)?;
 
+        let max_connections = connection_limit();
         let mut connections: Vec<Connection> = Vec::new();
+        let mut accept_paused_until: Option<Instant> = None;
 
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
-            loop {
-                if connections.len() >= MAX_CONNECTIONS {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        if stream.set_nonblocking(true).is_ok() {
-                            match rustls::ServerConnection::new(Arc::clone(&tls_config)) {
-                                Ok(tls) => connections.push(Connection {
-                                    stream,
-                                    state: State::TlsHandshaking { tls: Box::new(tls) },
-                                    deadline: Instant::now() + HEADER_TIMEOUT,
-                                }),
-                                Err(e) => eprintln!("[https-server] TLS init error: {e}"),
+            if accept_paused_until.is_some_and(|t| Instant::now() < t) {
+                // Out of descriptors: let existing connections drain first.
+            } else {
+                accept_paused_until = None;
+                while connections.len() < max_connections {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => {
+                            if stream.set_nonblocking(true).is_ok() {
+                                connections.extend(new_connection(stream));
                             }
                         }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e)
+                            if e.kind() == io::ErrorKind::Interrupted
+                                || e.kind() == io::ErrorKind::ConnectionAborted =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            // Never retry in place: a persistent error such as
+                            // EMFILE would otherwise spin here forever without
+                            // advancing (and so never closing) any connection.
+                            eprintln!("[{tag}] accept error: {e}");
+                            if is_resource_exhaustion(&e) {
+                                accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                            }
+                            break;
+                        }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => eprintln!("[https-server] accept error: {e}"),
                 }
             }
 
             connections.retain_mut(|conn| conn.advance(&root));
 
+            // No active connections — yield rather than spin-burn a CPU core.
             if connections.is_empty() {
                 std::thread::yield_now();
             }
         }
     }
+}
+
+/// Whether an accept error means the process or system is out of descriptors
+/// or memory, as opposed to a problem with one particular connection.
+fn is_resource_exhaustion(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+/// Number of connections the event loop may hold open at once.
+///
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit (as nginx and the Go
+/// runtime do), then sizes the connection budget so that every connection
+/// can hold its socket and file without exhausting the descriptor table.
+fn connection_limit() -> usize {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return MAX_CONNECTIONS;
+    }
+    if lim.rlim_cur < lim.rlim_max {
+        let raised = libc::rlimit {
+            rlim_cur: lim.rlim_max,
+            rlim_max: lim.rlim_max,
+        };
+        // May fail (e.g. macOS rejects values above OPEN_MAX); keep the
+        // current soft limit in that case.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            lim.rlim_cur = lim.rlim_max;
+        }
+    }
+    connections_for_fd_limit(lim.rlim_cur)
+}
+
+fn connections_for_fd_limit(nofile: libc::rlim_t) -> usize {
+    let budget = nofile.saturating_sub(RESERVED_FDS) / FDS_PER_CONNECTION;
+    (budget.min(MAX_CONNECTIONS as libc::rlim_t) as usize).max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,5 +625,20 @@ fn serve_file(url_path: &str, root: &Path, keepalive: bool) -> Response {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Response::not_found(),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Response::forbidden(),
         Err(_) => Response::internal_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_budget_fits_fd_limit() {
+        // Typical systemd/shell default soft limit.
+        assert_eq!(connections_for_fd_limit(1024), (1024 - 64) / 2);
+        // Large limits are capped at MAX_CONNECTIONS.
+        assert_eq!(connections_for_fd_limit(1 << 20), MAX_CONNECTIONS);
+        // Tiny limits still allow one connection rather than none.
+        assert_eq!(connections_for_fd_limit(16), 1);
     }
 }
