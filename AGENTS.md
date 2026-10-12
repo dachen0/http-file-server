@@ -66,6 +66,12 @@ Cipher structs have compile-time size assertions to catch ABI drift: AES-128-GCM
 - oversized headers — `431 Request Header Fields Too Large`
 - connection is always closed after the response (no keep-alive)
 
+## Descriptor limits
+
+- `connection_limit()` raises the soft `RLIMIT_NOFILE` to the hard limit, then budgets two fds per connection (socket + file) after reserving 64, capped at `MAX_CONNECTIONS`
+- accept errors never retry in place: the accept loop breaks so existing connections keep advancing and closing; on `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` accepting pauses for `ACCEPT_BACKOFF` (100 ms)
+- `serve` and `serve_tls` share one event loop, `Server::run`
+
 ## Linux-specific optimizations
 
 - `TCP_CORK`: enabled before sending response headers so headers and the first file chunk coalesce; disabled at EOF to flush the last segment

@@ -108,6 +108,7 @@ cargo build
 ## Notes and limitations
 
 - Linux only for kTLS, `sendfile`, and `TCP_CORK`; plain HTTP builds and runs on other platforms
+- the server raises its soft `RLIMIT_NOFILE` to the hard limit at startup and caps concurrent connections at `(limit - 64) / 2` (max 4096); raise the hard limit (e.g. `LimitNOFILE=` in a systemd unit) to allow more
 - no range requests
 - no directory listing
 - no client certificate authentication
